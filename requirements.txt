@@ -1,0 +1,21 @@
+tensorflow>=2.15,<2.23
+keras-tuner>=1.4
+numpy>=1.24
+scipy>=1.11
+scikit-learn>=1.3
+matplotlib>=3.8
+h5py>=3.10
+
+# Notes
+# 
+# tensorflow: models were trained inside the NGC container
+#   nvcr.io/nvidia/tensorflow:25.02-tf2-py3 (TensorFlow 2.17, CUDA/cuDNN for
+#   NVIDIA Blackwell GPUs, e.g. RTX 50-series). On a local install without
+#   this container, set the environment variable PINN_LSTM_NO_CUDNN=1 if you
+#   hit cuDNN RNN kernel errors.
+# keras-tuner: used for the Bayesian hyperparameter search
+#   (lidar_pinn_ekman_v2_extrap_tuning.py).
+# h5py: required by fig_alpha_shear_final.py, which reads model weights
+#   directly from the .h5 file (bypassing model.load_weights(), which is not
+#   always compatible between the tf_keras version used to train the models
+#   and standalone Keras 3).
