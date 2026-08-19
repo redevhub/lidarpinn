@@ -31,8 +31,13 @@ Loss:
 
     L_data   MSE on (u, v) at the measured heights
     L_cls    K-Means regime classification head (--a-cls 0 disables it)
-    L_ekman  MSE of the two Ekman residuals at collocation heights, with
-             du/dz, dv/dz and d/dz(Km du/dz) by automatic differentiation.
+    L_ekman  physics residual, selected explicitly via --physics-type:
+               'ekman' - the two Ekman-MOST residuals above, with du/dz,
+                         dv/dz and d/dz(Km du/dz) by automatic differentiation
+               'shear' - parameterised power-law shear constraint on the
+                         speed modulus alone (z dU/dz - alpha*U = 0), see
+                         physics_shear_powerlaw.py
+               'none'  - zero, regardless of --w-ekman
              Its weight is ramped from 0 to the target over --w-ekman-warmup
              epochs; early stopping is monitored on L_data, not the total loss
     L_bc     surface anchor, either (u, v) -> 0 at z0 + d or the measured
@@ -54,8 +59,19 @@ met_pressure and met_humidity (N,).
 Usage:
 
     python3 lidar_pinn_ekman_v2_extrap.py lidar_dataset.npz -o out \
-        --n-past 18 --epochs 120 --lat 42.615 \
+        --n-past 18 --epochs 120 --lat 42.615 --physics-type ekman \
         --train-max-height 111 --val-max-height 140 \
+        --anchor-mode met --z-met 2.0
+
+    # shear-constrained arm, same architecture, leakage-free temporal split
+    python3 lidar_pinn_ekman_v2_extrap.py lidar_dataset.npz -o out_shear \
+        --n-past 18 --epochs 120 --lat 42.615 --physics-type shear \
+        --anchor-mode met --z-met 2.0 \
+        --temporal-split-file temporal_block_split.npz
+
+    # physics-free control (same architecture, w_ekman=0)
+    python3 lidar_pinn_ekman_v2_extrap.py lidar_dataset.npz -o out_noek \
+        --n-past 18 --epochs 120 --lat 42.615 --w-ekman 0 \
         --anchor-mode met --z-met 2.0
 """
 
@@ -297,7 +313,7 @@ class PINNTrainer:
     def __init__(self, model, opt, w_ekman, w_bc, a_cls, f_coriolis,
                  z_min, z_max, uv_scale, w_ekman_warmup=20,
                  data_mask=None, anchor_mode="zero", z_met=2.0,
-                 n_colloc=None, w_ustar=0.0):
+                 n_colloc=None, w_ustar=0.0, physics_type="ekman"):
         # w_ustar : weight of the surface-layer u_star anchor, regularising
         #           the inferred friction velocity toward the neutral bulk
         #           log-law estimate at the lowest supervised gate (0 = off).
@@ -313,6 +329,7 @@ class PINNTrainer:
         #                       at height z_met,
         #              "none" = no anchor term.
         self.m = model; self.opt = opt
+        self.physics_type = str(physics_type)
         self.anchor_mode = str(anchor_mode)
         self.z_met = float(z_met)
         if data_mask is None:
@@ -378,12 +395,40 @@ class PINNTrainer:
             L_cls = tf.reduce_mean(
                 keras.losses.sparse_categorical_crossentropy(c_lab, probs))
 
-            # parameterised shear residual (z dU/dz - alpha U = 0)
-            if self.w_ekman_target == 0.0:
+            # physics residual: Ekman-MOST momentum balance, or the
+            # parameterised shear constraint (z dU/dz - alpha U = 0),
+            # selected explicitly via self.physics_type
+            if self.w_ekman_target == 0.0 or self.physics_type == "none":
                 L_ekman = tf.constant(0.0, dtype=tf.float32)
-            else:
+            elif self.physics_type == "shear":
                 L_ekman = shear_residual(
                     self.m, ctx, alpha, self.z_min, self.z_max, self.uv_scale)
+            elif self.physics_type == "ekman":
+                # need d/dz( Km dU/dz ): use nested gradient tapes
+                with tf.GradientTape(persistent=True) as t2:
+                    t2.watch(z_col)
+                    with tf.GradientTape(persistent=True) as t1:
+                        t1.watch(z_col)
+                        uv_col = self.m.profile(ctx, z_col)      # (B,Kc,2)
+                        u_c = uv_col[..., 0]; v_c = uv_col[..., 1]
+                    du = t1.gradient(u_c, z_col)                 # (B,Kc)
+                    dv = t1.gradient(v_c, z_col)
+                    Km = self.m.Km(z_col, u_star, inv_L)         # (B,Kc)
+                    flux_u = Km * du
+                    flux_v = Km * dv
+                    del t1
+                dflux_u = t2.gradient(flux_u, z_col)             # d/dz(Km du/dz)
+                dflux_v = t2.gradient(flux_v, z_col)
+                del t2
+
+                res_u = dflux_u + self.f * (v_c - ug_v)
+                res_v = dflux_v - self.f * (u_c - ug_u)
+                L_ekman = tf.reduce_mean(tf.square(res_u / self.uv_scale)
+                                         + tf.square(res_v / self.uv_scale))
+            else:
+                raise ValueError(
+                    f"unknown physics_type {self.physics_type!r}; "
+                    f"expected 'ekman', 'shear' or 'none'")
 
             # surface anchor
             if self.anchor_mode == "met" and uv_met is not None:
@@ -485,7 +530,8 @@ def main(npz_file, out, n_past, min_valid_alts, epochs,
          train_max_height=None, anchor_mode="zero", z_met=2.0,
          lstm1=None, lstm2=None, dec_units=None, context_dim=None,
          lr=None, batch_size=None, config_json=None, n_colloc=None,
-         w_ustar=None, val_max_height=None, seed=None, gpu_mem=None):
+         w_ustar=None, val_max_height=None, seed=None, gpu_mem=None,
+         temporal_split_file=None, physics_type="ekman"):
     configure_gpu_memory(gpu_mem)
     # resolve hyperparameters: explicit CLI > config JSON > defaults
     cfg = load_config_json(config_json) if config_json else {}
@@ -599,12 +645,23 @@ def main(npz_file, out, n_past, min_valid_alts, epochs,
     Xf_s = Xf.copy(); Xf_s[fin] = scaler.transform(Xf[fin])
     X_s = Xf_s.reshape(M, T_steps, F).astype(np.float32)
 
-    # split (stratified on regime)
+    # split (stratified on regime, OR temporal block split if requested)
     idx = np.arange(M)
-    tr, tmp = train_test_split(idx, test_size=0.3,
-                               random_state=RANDOM_STATE, stratify=C)
-    va, te = train_test_split(tmp, test_size=0.5,
-                              random_state=RANDOM_STATE, stratify=C[tmp])
+    if temporal_split_file:
+        _split = np.load(temporal_split_file)
+        if _split["t_idx"].size != M:
+            raise SystemExit(
+                f"Temporal split file has {_split['t_idx'].size:,} sequences "
+                f"but this run built {M:,}; the two pipelines are not aligned "
+                f"(check n_past/min_valid_alts/k_clusters match), aborting "
+                f"rather than silently using a misaligned split.")
+        tr, va, te = _split["train_pos"], _split["val_pos"], _split["test_pos"]
+        print(f"  Using TEMPORAL BLOCK split from {temporal_split_file}")
+    else:
+        tr, tmp = train_test_split(idx, test_size=0.3,
+                                   random_state=RANDOM_STATE, stratify=C)
+        va, te = train_test_split(tmp, test_size=0.5,
+                                  random_state=RANDOM_STATE, stratify=C[tmp])
     print(f"  Train {len(tr):,} | Val {len(va):,} | Test {len(te):,}")
 
     # neutral log-law bulk estimate of u_star at the lowest positive seen
@@ -630,7 +687,7 @@ def main(npz_file, out, n_past, min_valid_alts, epochs,
                           lstm1=lstm1, lstm2=lstm2,
                           dec_units=dec_units, context_dim=context_dim)
     model.adapt_height(alts)
-    _ = model((Xtr[:2], Ztr[:2]))
+    _ = model((Xtr[:2], Ztr[:2], UVMtr[:2]))
     model.summary()
 
     trainer = PINNTrainer(model, keras.optimizers.Adam(lr),
@@ -640,7 +697,8 @@ def main(npz_file, out, n_past, min_valid_alts, epochs,
                           data_mask=(seen if train_max_height is not None
                                      else None),
                           anchor_mode=anchor_mode, z_met=z_met,
-                          n_colloc=n_colloc, w_ustar=w_ustar)
+                          n_colloc=n_colloc, w_ustar=w_ustar,
+                          physics_type=physics_type)
 
     ds = (tf.data.Dataset.from_tensor_slices(
               (Xtr, Ztr, UVtr, Ctr, UVMtr, UBtr))
@@ -837,6 +895,18 @@ if __name__ == "__main__":
                          f"warmup (default {W_EKMAN_DEF}, or --config-json; "
                          f"use 0 for the physics-off arm — explicit CLI "
                          f"always overrides the JSON)")
+    ap.add_argument("--temporal-split-file", type=str, default=None,
+                    help="path to a .npz from build_temporal_block_split.py; "
+                         "if given, uses a leakage-free temporal split instead "
+                         "of the stratified random one")
+    ap.add_argument("--physics-type", choices=["ekman", "shear", "none"],
+                    default="ekman",
+                    help="which physics residual to use when --w-ekman != 0: "
+                         "'ekman' = genuine Ekman-MOST momentum balance "
+                         "(Coriolis-coupled, uses u_star/inv_L/ug via Km); "
+                         "'shear' = parameterised power-law shear constraint "
+                         "(uses alpha only). 'none' zeroes the residual "
+                         "regardless of --w-ekman (default: ekman).")
     ap.add_argument("--w-ekman-warmup", type=int, default=None,
                     help=f"epochs to linearly ramp the Ekman weight from 0 to "
                          f"target (default {W_EKMAN_WARMUP_DEF}, or --config-json)")
@@ -908,4 +978,5 @@ if __name__ == "__main__":
          batch_size=args.batch_size, config_json=args.config_json,
          n_colloc=args.n_colloc, w_ustar=args.w_ustar,
          val_max_height=args.val_max_height, seed=args.seed,
-         gpu_mem=args.gpu_mem)
+         gpu_mem=args.gpu_mem, temporal_split_file=args.temporal_split_file,
+         physics_type=args.physics_type)
